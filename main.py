@@ -1,16 +1,22 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List
 from runner import CodeExecutor, ExecutionResult
 import logging
+from fastapi.middleware.cors import CORSMiddleware
+
+origins = ['http://localhost:3000', 'https://prepflow.vercel.app']
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Prepflow Compiler API",
-             description="API for executing code in multiple programming languages",
-             version="1.0.0")
+              description="API for executing code in multiple programming languages",
+              version="1.0.0")
 
+app.add_middleware(CORSMiddleware, allow_origins=origins,
+                   allow_credentials=True,
+                   allow_methods=["*"],
+                   allow_headers=["*"], )
 # Initialize the code executor with security checks enabled
 executor = CodeExecutor(
     timeout=3,
@@ -18,14 +24,17 @@ executor = CodeExecutor(
     enable_security_checks=True
 )
 
+
 class CodeExecutionRequest(BaseModel):
     language: str
     code: str
     stdin: str = ""  # Default empty string instead of Optional
 
+
 @app.get('/')
 async def root():
     return {'message': 'Prepflow Compiler Backend Working....', 'success': True}
+
 
 @app.get('/languages')
 async def get_languages():
@@ -42,14 +51,15 @@ async def get_languages():
             }
     return {'languages': languages}
 
+
 @app.post('/execute')
 async def execute_code(request: CodeExecutionRequest):
     """
     Execute code in the specified programming language.
-    
+
     Available languages are dynamically determined based on system configuration.
     Use GET /languages to see available languages.
-    
+
     Returns:
         The execution result including:
         - success: boolean indicating if the execution was successful
@@ -96,8 +106,8 @@ async def execute_code(request: CodeExecutionRequest):
         # Clean up typescript output if needed
         if request.language == 'typescript' and response['output']:
             output_lines = response['output'].splitlines()
-            cleaned_lines = [line for line in output_lines 
-                           if not line.startswith('Successfully compiled')]
+            cleaned_lines = [line for line in output_lines
+                             if not line.startswith('Successfully compiled')]
             response['output'] = '\n'.join(cleaned_lines)
 
         # For compilation errors, format and return the error details
@@ -111,7 +121,7 @@ async def execute_code(request: CodeExecutionRequest):
                     # Extract just the filename from the full path
                     lines = error_message.split('\n')
                     formatted_lines = []
-                    
+
                     for line in lines:
                         if '): error' in line:
                             # Extract error details
@@ -123,12 +133,13 @@ async def execute_code(request: CodeExecutionRequest):
                                 loc_parts = location.split(',')
                                 if len(loc_parts) == 2:
                                     line_num, col = loc_parts
-                                    formatted_lines.append(f"Error at line {line_num}, column {col}: {message}")
+                                    formatted_lines.append(
+                                        f"Error at line {line_num}, column {col}: {message}")
                                 else:
                                     formatted_lines.append(f"Error: {message}")
                         elif line.strip():  # Keep any non-empty lines that aren't error lines
                             formatted_lines.append(line)
-                    
+
                     if formatted_lines:
                         formatted_error = '\n'.join(formatted_lines)
 
@@ -145,7 +156,7 @@ async def execute_code(request: CodeExecutionRequest):
                 'compile_error': error_message,
                 'output': formatted_error
             }
-        
+
         # For validation errors, return 400 status
         if not result.success and result.stage == 'validation':
             raise HTTPException(
