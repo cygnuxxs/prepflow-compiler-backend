@@ -1,0 +1,39 @@
+name: Send Hourly Email
+
+on:
+  schedule:
+    - cron: "0 * * * *" # every hour at minute 0
+  workflow_dispatch:     # allows manual trigger too
+
+jobs:
+  send_email:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          # SMTP server configuration
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+
+          # Authentication
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+
+          # Email details
+          subject: "Hourly Report - $(date)"
+          to: recipient@example.com
+          from: ${{ secrets.EMAIL_USERNAME }}
+          body: |
+            Hi there 👋
+
+            You have borrowed 1200 from Ashok.
+            Please remember to repay the amount as soon as possible.
+
+            This is your automated hourly email from GitHub Actions.
+            Sent at: $(date -u)
+
+            Regards,
+            GitHub Bot 🤖
