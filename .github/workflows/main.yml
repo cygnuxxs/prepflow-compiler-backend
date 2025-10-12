@@ -24,7 +24,7 @@ jobs:
 
           # Email details
           subject: "Hourly Report - $(date)"
-          to: recipient@example.com
+          to: ksai3393@gmail.com
           from: ${{ secrets.EMAIL_USERNAME }}
           body: |
             Hi there 👋
