@@ -29,7 +29,7 @@ jobs:
           body: |
             Hi there 👋
 
-            You have borrowed 1200 from Ashok.
+            You have borrowed 200 from Ashok.
             Please remember to repay the amount as soon as possible.
 
             This is your automated hourly email from GitHub Actions.
