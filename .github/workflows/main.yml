@@ -2,7 +2,7 @@ name: Send Hourly Email
 
 on:
   schedule:
-    - cron: "0 */6 * * *" # every hour at minute 0
+    - cron: "0 */24 * * *" # every hour at minute 0
   workflow_dispatch:     # allows manual trigger too
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
           body: |
             Hi there 👋
 
-            You have borrowed 1200 from Ashok.
+            You have borrowed 200 from Ashok.
             Please remember to repay the amount as soon as possible.
 
             This is your automated hourly email from GitHub Actions.
