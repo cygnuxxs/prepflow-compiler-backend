@@ -3,13 +3,16 @@ import tempfile
 import os
 from typing import Dict, Any, Optional, List, Union
 from pathlib import Path
+from fastapi import WebSocket
 import logging
+import asyncio
 import time
 import shutil
 import signal
 import psutil
 from dataclasses import dataclass
 from enum import Enum
+from starlette.websockets import WebSocketDisconnect
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -143,6 +146,322 @@ class CodeExecutor:
 
         # Validate system dependencies
         self._validate_system_dependencies()
+
+    async def execute_stream(self, websocket: WebSocket, language: str, code: str):
+        """Stream execution output and handle live input over WebSocket."""
+        # Validate inputs
+        if not code.strip():
+            await websocket.send_text("No code provided")
+            return
+
+        if language not in self.LANGUAGES:
+            await websocket.send_text(f"Unsupported language: {language}. Available: {list(self.LANGUAGES.keys())}")
+            return
+
+        if language not in self.available_languages:
+            await websocket.send_text(f"Language '{language}' is not available on this system")
+            return
+
+        config = self.LANGUAGES[language]
+
+        try:
+            # Security check
+            self._check_security(code)
+
+            # Java-specific validation
+            if language == 'java' and not self._validate_java_class(code):
+                await websocket.send_text("Java code must contain 'public class Main' with 'public static void main' method")
+                return
+
+        except SecurityError as e:
+            await websocket.send_text(f"Security check failed: {str(e)}")
+            return
+
+        # Create temporary directory
+        with tempfile.TemporaryDirectory(dir=self.working_dir) as tmpdir:
+            tmp_path = Path(tmpdir)
+
+            try:
+                # Write source code
+                source_file = tmp_path / self._get_safe_filename(language)
+                source_file.write_text(code, encoding='utf-8')
+                logger.info(f"Created source file: {source_file}")
+
+                # Compile if necessary
+                compile_result = self._compile_code(
+                    config, tmp_path, source_file)
+                if compile_result["error"]:
+                    await websocket.send_text(f"Compilation failed:\n{compile_result['error']}")
+                    return
+
+                executable = compile_result["executable"]
+
+                # Prepare execution command
+                memory_limit_mb = self.memory_limit_kb // 1024
+                format_args = {
+                    'file': str(source_file),
+                    'exe': executable,
+                    'js_file': executable,
+                    'dir': str(tmp_path),
+                    'main_class': config.main_class,
+                    'memory_limit': memory_limit_mb
+                }
+
+                run_cmd = self._format_command(config.run_cmd, **format_args)
+                logger.info(f"Executing with command: {' '.join(run_cmd)}")
+
+                start_time = time.time()
+                # Track last activity (stdout/read or stdin/write) to implement inactivity-based timeout
+                last_activity = time.monotonic()
+
+                # Start subprocess with its own process group/session so we can signal it
+                create_kwargs = {}
+                if os.name != 'nt':
+                    create_kwargs['start_new_session'] = True
+                else:
+                    try:
+                        create_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+                    except AttributeError:
+                        create_kwargs['creationflags'] = 0
+
+                process = await asyncio.create_subprocess_exec(
+                    *run_cmd,
+                    cwd=str(tmp_path),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    # Merge stderr to stdout to match synchronous behavior
+                    stderr=asyncio.subprocess.STDOUT,
+                    **create_kwargs
+                )
+
+                # Define pipe reader (now only stdout since merged)
+                async def read_pipe(pipe, ws):
+                    while True:
+                        try:
+                            chunk = await pipe.read(1024)
+                            if len(chunk) == 0:
+                                break
+                            text = chunk.decode('utf-8', errors='replace')
+                            # Apply output size limit per chunk for safety
+                            text = self._limit_output_size(text)
+                            # Update last activity on output
+                            nonlocal last_activity
+                            last_activity = time.monotonic()
+                            await ws.send_text(text)
+                        except WebSocketDisconnect:
+                            break
+                        except Exception as e:
+                            logger.error(f"Error reading pipe: {e}")
+                            break
+
+                # Define input handler with polling to check process status
+                async def handle_input(ws, stdin, proc):
+                    """Handle WebSocket input and forward to process stdin."""
+                    input_queue = asyncio.Queue()
+
+                    async def interrupt_process():
+                        """Send SIGINT (Ctrl+C) to the running process with graceful fallback."""
+                        try:
+                            if os.name != 'nt':
+                                try:
+                                    os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                                except OSError:
+                                    # If process group signal fails, try direct
+                                    os.kill(proc.pid, signal.SIGINT)
+                            else:
+                                # On Windows, prefer CTRL_BREAK_EVENT when in a new process group
+                                try:
+                                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                                except Exception:
+                                    proc.terminate()
+                        except Exception as e:
+                            logger.error(f"Error sending interrupt: {e}")
+                        
+                        # Give a short grace period; if still alive, escalate
+                        try:
+                            for _ in range(10):  # ~1s total
+                                if proc.returncode is not None:
+                                    return
+                                await asyncio.sleep(0.1)
+                            # Escalate to SIGTERM / terminate
+                            if os.name != 'nt':
+                                try:
+                                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                                except OSError:
+                                    try:
+                                        os.kill(proc.pid, signal.SIGTERM)
+                                    except Exception:
+                                        proc.terminate()
+                            else:
+                                try:
+                                    proc.terminate()
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            logger.error(f"Error escalating termination: {e}")
+                    
+                    async def receive_input():
+                        """Continuously receive input from WebSocket."""
+                        try:
+                            while True:
+                                data = await ws.receive_text()
+                                await input_queue.put(data)
+                        except WebSocketDisconnect:
+                            await input_queue.put(None)  # Signal disconnect
+                        except Exception as e:
+                            logger.error(f"Receive error: {e}")
+                            await input_queue.put(None)
+                    
+                    # Start input receiver task
+                    receiver_task = asyncio.create_task(receive_input())
+                    
+                    try:
+                        while proc.returncode is None:
+                            try:
+                                # Wait for input with a short timeout to check process status
+                                data = await asyncio.wait_for(input_queue.get(), timeout=0.1)
+                                
+                                if data is None:  # Disconnected
+                                    break
+                                
+                                # Normalize data for control checks (don't strip control chars)
+                                trimmed = data.strip().lower() if data is not None else ""
+
+                                # Check for exit command
+                                if trimmed == "exit()":
+                                    if os.name != 'nt':
+                                        try:
+                                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                                        except OSError:
+                                            proc.terminate()
+                                    else:
+                                        proc.terminate()
+                                    await ws.send_text("\nProcess terminated by user.\n")
+                                    break
+
+                                # Check for Ctrl+C / SIGINT requests
+                                # Accept any of: actual ETX (\x03), "^C", "ctrl+c", "SIGINT"
+                                is_ctrl_c = (
+                                    data == "\x03" or
+                                    trimmed in ("^c", "ctrl+c", "sigint")
+                                )
+                                if is_ctrl_c:
+                                    await ws.send_text("\n^C\n")
+                                    await interrupt_process()
+                                    break
+                                
+                                # Write input to process stdin
+                                # Ensure newline so languages waiting on line-buffered input (e.g. Python input()) proceed
+                                if not data.endswith("\n"):
+                                    data = data + "\n"
+                                stdin.write(data.encode('utf-8'))
+                                await stdin.drain()
+                                # Update last activity on input
+                                nonlocal last_activity
+                                last_activity = time.monotonic()
+                                
+                            except asyncio.TimeoutError:
+                                # No input received, continue checking if process is alive
+                                continue
+                                
+                    finally:
+                        receiver_task.cancel()
+                        try:
+                            await receiver_task
+                        except asyncio.CancelledError:
+                            pass
+                        try:
+                            stdin.close()
+                        except:
+                            pass
+
+                # Define memory monitor
+                async def memory_monitor(proc, ws, limit_kb):
+                    while proc.returncode is None:
+                        await asyncio.sleep(0.5)
+                        try:
+                            p = psutil.Process(proc.pid)
+                            mem = p.memory_info().rss // 1024
+                            if mem > limit_kb:
+                                if os.name != 'nt':
+                                    try:
+                                        os.killpg(os.getpgid(
+                                            proc.pid), signal.SIGTERM)
+                                    except OSError:
+                                        proc.terminate()
+                                else:
+                                    proc.terminate()
+                                await ws.send_text(f"\nMemory limit exceeded ({mem}KB > {limit_kb}KB)\n")
+                                break
+                        except psutil.NoSuchProcess:
+                            break
+                        except Exception as e:
+                            logger.error(f"Mem monitor error: {e}")
+
+                # Create tasks
+                stdout_task = asyncio.create_task(
+                    read_pipe(process.stdout, websocket))
+                input_task = asyncio.create_task(
+                    handle_input(websocket, process.stdin, process))
+                mem_task = asyncio.create_task(memory_monitor(
+                    process, websocket, self.memory_limit_kb))
+
+                # Inactivity-based timeout watchdog (prevents killing while user is typing)
+                async def inactivity_watchdog():
+                    # Use a more lenient threshold for interactive sessions
+                    threshold = max(self.timeout, 30)
+                    try:
+                        while process.returncode is None:
+                            await asyncio.sleep(0.25)
+                            if time.monotonic() - last_activity > threshold:
+                                if os.name != 'nt':
+                                    try:
+                                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                                    except OSError:
+                                        process.terminate()
+                                else:
+                                    process.terminate()
+                                await websocket.send_text(f"\nExecution timed out after {threshold} seconds of inactivity\n")
+                                break
+                    except Exception as e:
+                        logger.error(f"Watchdog error: {e}")
+
+                timeout_task = asyncio.create_task(inactivity_watchdog())
+
+                # Run IO tasks
+                try:
+                    await asyncio.gather(stdout_task, input_task, return_exceptions=True)
+                finally:
+                    # Cleanup tasks
+                    for task in [stdout_task, input_task]:
+                        if not task.done():
+                            task.cancel()
+                    try:
+                        await process.wait()
+                    except:
+                        pass
+
+                # Cancel monitors
+                timeout_task.cancel()
+                try:
+                    await timeout_task
+                except asyncio.CancelledError:
+                    pass
+                mem_task.cancel()
+                try:
+                    await mem_task
+                except asyncio.CancelledError:
+                    pass
+
+                # Send final info
+                exec_time = time.time() - start_time
+                message = f"""
+Process exited with code {process.returncode}
+Execution time: {round(exec_time, 3)}"""
+                await websocket.send_text(message)
+            except Exception as e:
+                logger.error(f"Unexpected error in execute_stream: {str(e)}")
+                await websocket.send_text(f"Unexpected error: {str(e)}")
 
     def _validate_system_dependencies(self) -> None:
         """Check if required system dependencies are available."""
@@ -498,37 +817,3 @@ def run_code(language: str, code: str, stdin: str = "", **kwargs) -> Dict[str, A
         'execution_time': result.execution_time,
         'memory_used_kb': result.memory_used_kb
     }
-
-
-# Example usage
-if __name__ == "__main__":
-    # Example 1: Python code
-    executor = CodeExecutor(timeout=10)
-
-    python_code = '''
-print("Hello, World!")
-for i in range(3):
-    print(f"Count: {i}")
-'''
-
-    result = executor.execute('python', python_code)
-    print(f"Python result: {result.success}")
-    print(f"Output: {result.output}")
-
-    # Example 2: C++ code
-    cpp_code = '''
-#include <iostream>
-using namespace std;
-
-int main() {
-    cout << "Hello from C++!" << endl;
-    return 0;
-}
-'''
-
-    result = executor.execute('cpp', cpp_code)
-    print(f"C++ result: {result.success}")
-    print(f"Output: {result.output}")
-
-    # Show available languages
-    print(f"Available languages: {executor.get_supported_languages()}")
