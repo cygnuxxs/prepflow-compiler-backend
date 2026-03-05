@@ -1,7 +1,7 @@
 import subprocess
 import tempfile
 import os
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 from fastapi import WebSocket
 import logging
@@ -55,6 +55,11 @@ class ExecutionResult:
 class SecurityError(Exception):
     """Raised when security constraints are violated."""
     pass
+
+
+@dataclass
+class ExecutionSession:
+    last_activity: float
 
 
 class CodeExecutor:
@@ -119,6 +124,8 @@ class CodeExecutor:
         'require("fs")', 'require("child_process")', 'process.exit(',
         'std::system', 'std::exit', 'exit('
     ]
+    # Pre-lowercased pairs (original, lower) — avoids re-lowercasing on every security check
+    _BLACKLIST_LOWER: List = [(p, p.lower()) for p in SECURITY_BLACKLIST]
 
     def __init__(self,
                  timeout: int = 5,
@@ -126,16 +133,6 @@ class CodeExecutor:
                  max_output_size: int = 1024 * 1024,
                  working_dir: Optional[str] = None,
                  enable_security_checks: bool = True):
-        """
-        Initialize CodeExecutor.
-
-        Args:
-            timeout: Maximum execution time in seconds
-            memory_limit_kb: Memory limit in KB
-            max_output_size: Maximum output size in bytes
-            working_dir: Working directory for temporary files
-            enable_security_checks: Whether to perform security checks
-        """
         self.timeout = max(1, min(timeout, 30))  # Clamp between 1-30 seconds
         self.memory_limit_kb = max(
             64 * 1024, min(memory_limit_kb, 1024 * 1024))  # 64MB - 1GB
@@ -143,8 +140,6 @@ class CodeExecutor:
             1024, min(max_output_size, 10 * 1024 * 1024))  # 1KB - 10MB
         self.working_dir = working_dir
         self.enable_security_checks = enable_security_checks
-
-        # Validate system dependencies
         self._validate_system_dependencies()
 
     async def execute_stream(self, websocket: WebSocket, language: str, code: str):
@@ -211,10 +206,9 @@ class CodeExecutor:
                 logger.info(f"Executing with command: {' '.join(run_cmd)}")
 
                 start_time = time.time()
-                # Track last activity (stdout/read or stdin/write) to implement inactivity-based timeout
-                last_activity = time.monotonic()
+                session = ExecutionSession(last_activity=time.monotonic())
 
-                # Start subprocess with its own process group/session so we can signal it
+                # Start subprocess
                 create_kwargs = {}
                 if os.name != 'nt':
                     create_kwargs['start_new_session'] = True
@@ -229,210 +223,23 @@ class CodeExecutor:
                     cwd=str(tmp_path),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
-                    # Merge stderr to stdout to match synchronous behavior
                     stderr=asyncio.subprocess.STDOUT,
                     **create_kwargs
                 )
 
-                # Define pipe reader (now only stdout since merged)
-                async def read_pipe(pipe, ws):
-                    while True:
-                        try:
-                            chunk = await pipe.read(1024)
-                            if len(chunk) == 0:
-                                break
-                            text = chunk.decode('utf-8', errors='replace')
-                            # Apply output size limit per chunk for safety
-                            text = self._limit_output_size(text)
-                            # Update last activity on output
-                            nonlocal last_activity
-                            last_activity = time.monotonic()
-                            await ws.send_text(text)
-                        except WebSocketDisconnect:
-                            break
-                        except Exception as e:
-                            logger.error(f"Error reading pipe: {e}")
-                            break
-
-                # Define input handler with polling to check process status
-                async def handle_input(ws, stdin, proc):
-                    """Handle WebSocket input and forward to process stdin."""
-                    input_queue = asyncio.Queue()
-
-                    async def interrupt_process():
-                        """Send SIGINT (Ctrl+C) to the running process with graceful fallback."""
-                        try:
-                            if os.name != 'nt':
-                                try:
-                                    os.killpg(os.getpgid(proc.pid), signal.SIGINT)
-                                except OSError:
-                                    # If process group signal fails, try direct
-                                    os.kill(proc.pid, signal.SIGINT)
-                            else:
-                                # On Windows, prefer CTRL_BREAK_EVENT when in a new process group
-                                try:
-                                    proc.send_signal(signal.CTRL_BREAK_EVENT)
-                                except Exception:
-                                    proc.terminate()
-                        except Exception as e:
-                            logger.error(f"Error sending interrupt: {e}")
-                        
-                        # Give a short grace period; if still alive, escalate
-                        try:
-                            for _ in range(10):  # ~1s total
-                                if proc.returncode is not None:
-                                    return
-                                await asyncio.sleep(0.1)
-                            # Escalate to SIGTERM / terminate
-                            if os.name != 'nt':
-                                try:
-                                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                                except OSError:
-                                    try:
-                                        os.kill(proc.pid, signal.SIGTERM)
-                                    except Exception:
-                                        proc.terminate()
-                            else:
-                                try:
-                                    proc.terminate()
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            logger.error(f"Error escalating termination: {e}")
-                    
-                    async def receive_input():
-                        """Continuously receive input from WebSocket."""
-                        try:
-                            while True:
-                                data = await ws.receive_text()
-                                await input_queue.put(data)
-                        except WebSocketDisconnect:
-                            await input_queue.put(None)  # Signal disconnect
-                        except Exception as e:
-                            logger.error(f"Receive error: {e}")
-                            await input_queue.put(None)
-                    
-                    # Start input receiver task
-                    receiver_task = asyncio.create_task(receive_input())
-                    
-                    try:
-                        while proc.returncode is None:
-                            try:
-                                # Wait for input with a short timeout to check process status
-                                data = await asyncio.wait_for(input_queue.get(), timeout=0.1)
-                                
-                                if data is None:  # Disconnected
-                                    break
-                                
-                                # Normalize data for control checks (don't strip control chars)
-                                trimmed = data.strip().lower() if data is not None else ""
-
-                                # Check for exit command
-                                if trimmed == "exit()":
-                                    if os.name != 'nt':
-                                        try:
-                                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                                        except OSError:
-                                            proc.terminate()
-                                    else:
-                                        proc.terminate()
-                                    await ws.send_text("\nProcess terminated by user.\n")
-                                    break
-
-                                # Check for Ctrl+C / SIGINT requests
-                                # Accept any of: actual ETX (\x03), "^C", "ctrl+c", "SIGINT"
-                                is_ctrl_c = (
-                                    data == "\x03" or
-                                    trimmed in ("^c", "ctrl+c", "sigint")
-                                )
-                                if is_ctrl_c:
-                                    await ws.send_text("\n^C\n")
-                                    await interrupt_process()
-                                    break
-                                
-                                # Write input to process stdin
-                                # Ensure newline so languages waiting on line-buffered input (e.g. Python input()) proceed
-                                if not data.endswith("\n"):
-                                    data = data + "\n"
-                                stdin.write(data.encode('utf-8'))
-                                await stdin.drain()
-                                # Update last activity on input
-                                nonlocal last_activity
-                                last_activity = time.monotonic()
-                                
-                            except asyncio.TimeoutError:
-                                # No input received, continue checking if process is alive
-                                continue
-                                
-                    finally:
-                        receiver_task.cancel()
-                        try:
-                            await receiver_task
-                        except asyncio.CancelledError:
-                            pass
-                        try:
-                            stdin.close()
-                        except:
-                            pass
-
-                # Define memory monitor
-                async def memory_monitor(proc, ws, limit_kb):
-                    while proc.returncode is None:
-                        await asyncio.sleep(0.5)
-                        try:
-                            p = psutil.Process(proc.pid)
-                            mem = p.memory_info().rss // 1024
-                            if mem > limit_kb:
-                                if os.name != 'nt':
-                                    try:
-                                        os.killpg(os.getpgid(
-                                            proc.pid), signal.SIGTERM)
-                                    except OSError:
-                                        proc.terminate()
-                                else:
-                                    proc.terminate()
-                                await ws.send_text(f"\nMemory limit exceeded ({mem}KB > {limit_kb}KB)\n")
-                                break
-                        except psutil.NoSuchProcess:
-                            break
-                        except Exception as e:
-                            logger.error(f"Mem monitor error: {e}")
-
-                # Create tasks
+                # Create IO tasks
                 stdout_task = asyncio.create_task(
-                    read_pipe(process.stdout, websocket))
+                    self._read_pipe(process.stdout, websocket, session))
                 input_task = asyncio.create_task(
-                    handle_input(websocket, process.stdin, process))
-                mem_task = asyncio.create_task(memory_monitor(
-                    process, websocket, self.memory_limit_kb))
+                    self._handle_input(websocket, process.stdin, process, session))
+                mem_task = asyncio.create_task(
+                    self._memory_monitor(process, websocket, self.memory_limit_kb))
+                timeout_task = asyncio.create_task(
+                    self._inactivity_watchdog(process, websocket, session))
 
-                # Inactivity-based timeout watchdog (prevents killing while user is typing)
-                async def inactivity_watchdog():
-                    # Use a more lenient threshold for interactive sessions
-                    threshold = max(self.timeout, 30)
-                    try:
-                        while process.returncode is None:
-                            await asyncio.sleep(0.25)
-                            if time.monotonic() - last_activity > threshold:
-                                if os.name != 'nt':
-                                    try:
-                                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                                    except OSError:
-                                        process.terminate()
-                                else:
-                                    process.terminate()
-                                await websocket.send_text(f"\nExecution timed out after {threshold} seconds of inactivity\n")
-                                break
-                    except Exception as e:
-                        logger.error(f"Watchdog error: {e}")
-
-                timeout_task = asyncio.create_task(inactivity_watchdog())
-
-                # Run IO tasks
                 try:
                     await asyncio.gather(stdout_task, input_task, return_exceptions=True)
                 finally:
-                    # Cleanup tasks
                     for task in [stdout_task, input_task]:
                         if not task.done():
                             task.cancel()
@@ -441,7 +248,6 @@ class CodeExecutor:
                     except:
                         pass
 
-                # Cancel monitors
                 timeout_task.cancel()
                 try:
                     await timeout_task
@@ -453,15 +259,177 @@ class CodeExecutor:
                 except asyncio.CancelledError:
                     pass
 
-                # Send final info
                 exec_time = time.time() - start_time
-                message = f"""
-Process exited with code {process.returncode}
-Execution time: {round(exec_time, 3)}"""
+                message = f"\nProcess exited with code {process.returncode}\nExecution time: {round(exec_time, 3)}"
                 await websocket.send_text(message)
             except Exception as e:
-                logger.error(f"Unexpected error in execute_stream: {str(e)}")
+                logger.error(f"Unexpected error in execute_stream: {str(e)}", exc_info=True)
                 await websocket.send_text(f"Unexpected error: {str(e)}")
+
+    async def _read_pipe(self, pipe, ws: WebSocket, session: ExecutionSession):
+        """Read output from process pipe and send to WebSocket."""
+        total_bytes = 0
+        while True:
+            try:
+                chunk = await pipe.read(4096)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                text = chunk.decode('utf-8', errors='replace')
+                session.last_activity = time.monotonic()
+                if total_bytes > self.max_output_size:
+                    await ws.send_text(text)
+                    await ws.send_text(f"\n[Output truncated at {self.max_output_size} bytes]")
+                    break
+                await ws.send_text(text)
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"Error reading pipe: {e}", exc_info=True)
+                break
+
+    async def _interrupt_process(self, proc):
+        """Send SIGINT (Ctrl+C) to the running process with graceful fallback."""
+        try:
+            if os.name != 'nt':
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+                except OSError:
+                    os.kill(proc.pid, signal.SIGINT)
+            else:
+                try:
+                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                except Exception:
+                    proc.terminate()
+        except Exception as e:
+            logger.error(f"Error sending interrupt: {e}", exc_info=True)
+
+        try:
+            for _ in range(10):  # ~1s total
+                if proc.returncode is not None:
+                    return
+                await asyncio.sleep(0.1)
+            # Escalate
+            if os.name != 'nt':
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except OSError:
+                    try:
+                        os.kill(proc.pid, signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
+            else:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"Error escalating termination: {e}", exc_info=True)
+
+    async def _receive_input(self, ws: WebSocket, input_queue: asyncio.Queue):
+        """Continuously receive input from WebSocket."""
+        try:
+            while True:
+                data = await ws.receive_text()
+                await input_queue.put(data)
+        except WebSocketDisconnect:
+            await input_queue.put(None)
+        except Exception as e:
+            logger.error(f"Receive error: {e}", exc_info=True)
+            await input_queue.put(None)
+
+    async def _handle_input(self, ws: WebSocket, stdin, proc, session: ExecutionSession):
+        """Handle WebSocket input and forward to process stdin."""
+        input_queue = asyncio.Queue()
+        receiver_task = asyncio.create_task(self._receive_input(ws, input_queue))
+
+        try:
+            while proc.returncode is None:
+                try:
+                    data = await asyncio.wait_for(input_queue.get(), timeout=0.1)
+
+                    if data is None:  # Disconnected
+                        break
+
+                    trimmed = data.strip().lower() if data is not None else ""
+
+                    if trimmed == "exit()":
+                        if os.name != 'nt':
+                            try:
+                                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                            except OSError:
+                                proc.terminate()
+                        else:
+                            proc.terminate()
+                        await ws.send_text("\nProcess terminated by user.\n")
+                        break
+
+                    is_ctrl_c = (data == "\x03" or trimmed in ("^c", "ctrl+c", "sigint"))
+                    if is_ctrl_c:
+                        await ws.send_text("\n^C\n")
+                        await self._interrupt_process(proc)
+                        break
+
+                    if not data.endswith("\n"):
+                        data = data + "\n"
+                    stdin.write(data.encode('utf-8'))
+                    await stdin.drain()
+                    session.last_activity = time.monotonic()
+
+                except asyncio.TimeoutError:
+                    continue
+
+        finally:
+            receiver_task.cancel()
+            try:
+                await receiver_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                stdin.close()
+            except:
+                pass
+
+    async def _memory_monitor(self, proc, ws: WebSocket, limit_kb: int):
+        """Monitor memory usage of the process."""
+        while proc.returncode is None:
+            await asyncio.sleep(0.5)
+            try:
+                p = psutil.Process(proc.pid)
+                mem = p.memory_info().rss // 1024
+                if mem > limit_kb:
+                    if os.name != 'nt':
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        except OSError:
+                            proc.terminate()
+                    else:
+                        proc.terminate()
+                    await ws.send_text(f"\nMemory limit exceeded ({mem}KB > {limit_kb}KB)\n")
+                    break
+            except psutil.NoSuchProcess:
+                break
+            except Exception as e:
+                logger.error(f"Mem monitor error: {e}", exc_info=True)
+
+    async def _inactivity_watchdog(self, proc, ws: WebSocket, session: ExecutionSession):
+        """Monitor for inactivity and terminate if necessary."""
+        threshold = max(self.timeout, 30)
+        try:
+            while proc.returncode is None:
+                await asyncio.sleep(0.25)
+                if time.monotonic() - session.last_activity > threshold:
+                    if os.name != 'nt':
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        except OSError:
+                            proc.terminate()
+                    else:
+                        proc.terminate()
+                    await ws.send_text(f"\nExecution timed out after {threshold} seconds of inactivity\n")
+                    break
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}", exc_info=True)
 
     def _validate_system_dependencies(self) -> None:
         """Check if required system dependencies are available."""
@@ -475,13 +443,13 @@ Execution time: {round(exec_time, 3)}"""
             'tsc': 'typescript'
         }
 
-        self.available_languages = set()
+        self.available_languages: set = set()
         for cmd, lang in required_commands.items():
             if shutil.which(cmd):
                 self.available_languages.add(lang)
             else:
-                logger.warning(
-                    f"Command '{cmd}' not found. Language '{lang}' will be unavailable.")
+                logger.warning(f"Command '{cmd}' not found. Language '{lang}' will be unavailable.")
+        self._supported_languages: List[str] = sorted(self.available_languages)
 
     def _check_security(self, code: str) -> None:
         """Check code for potential security issues."""
@@ -489,10 +457,10 @@ Execution time: {round(exec_time, 3)}"""
             return
 
         code_lower = code.lower()
-        for pattern in self.SECURITY_BLACKLIST:
-            if pattern.lower() in code_lower:
+        for original, lower in self._BLACKLIST_LOWER:
+            if lower in code_lower:
                 raise SecurityError(
-                    f"Potentially unsafe code detected: {pattern}")
+                    f"Potentially unsafe code detected: {original}")
 
     def _format_command(self, cmd_template: List[str], **kwargs: Any) -> List[str]:
         """Format command template with variables."""
@@ -511,18 +479,7 @@ Execution time: {round(exec_time, 3)}"""
 
     def _validate_java_class(self, code: str) -> bool:
         """Validate that Java code has proper Main class structure."""
-        lines = code.strip().split('\n')
-        has_main_class = False
-        has_main_method = False
-
-        for line in lines:
-            line = line.strip()
-            if line.startswith('public class Main'):
-                has_main_class = True
-            elif 'public static void main' in line:
-                has_main_method = True
-
-        return has_main_class and has_main_method
+        return 'public class Main' in code and 'public static void main' in code
 
     def _compile_code(self, lang_config: LanguageConfig, tmpdir: Path, source_file: Path) -> Dict[str, Any]:
         """Compile code if needed. Returns dict with executable path and error info."""
@@ -585,7 +542,7 @@ Execution time: {round(exec_time, 3)}"""
             return {"executable": None, "error": error_msg}
         except Exception as e:
             error_msg = f"Compilation error: {str(e)}"
-            logger.error(error_msg)
+            logger.error(error_msg, exc_info=True)
             return {"executable": None, "error": error_msg}
 
     def _limit_output_size(self, output: str) -> str:
@@ -604,15 +561,6 @@ Execution time: {round(exec_time, 3)}"""
         # Use Main for Java, otherwise use program
         base_name = "Main" if language == "java" else "program"
         return f"{base_name}{config.extension}"
-
-    def _monitor_process_memory(self, process: subprocess.Popen) -> Optional[int]:
-        """Monitor process memory usage."""
-        try:
-            ps_process = psutil.Process(process.pid)
-            memory_info = ps_process.memory_info()
-            return memory_info.rss // 1024  # Convert to KB
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return None
 
     def execute(self, language: str, code: str, stdin: str = "") -> ExecutionResult:
         """
@@ -762,7 +710,7 @@ Execution time: {round(exec_time, 3)}"""
                     )
 
                 except Exception as e:
-                    logger.error(f"Execution error: {str(e)}")
+                    logger.error(f"Execution error: {str(e)}", exc_info=True)
                     return ExecutionResult(
                         success=False,
                         language=language,
@@ -771,7 +719,7 @@ Execution time: {round(exec_time, 3)}"""
                     )
 
             except Exception as e:
-                logger.error(f"Unexpected error in execute: {str(e)}")
+                logger.error(f"Unexpected error in execute: {str(e)}", exc_info=True)
                 return ExecutionResult(
                     success=False,
                     language=language,
@@ -781,7 +729,7 @@ Execution time: {round(exec_time, 3)}"""
 
     def get_supported_languages(self) -> List[str]:
         """Get list of supported and available languages."""
-        return sorted(self.available_languages)
+        return self._supported_languages
 
     def get_language_info(self, language: str) -> Optional[LanguageConfig]:
         """Get configuration info for a specific language."""

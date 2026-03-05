@@ -1,10 +1,17 @@
 # Use official Python runtime as a parent image
 FROM python:3.11-slim
 
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PORT=10000
+# Use uv's project venv
+ENV PATH="/app/.venv/bin:${PATH}"
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
 
 # Set working directory
 WORKDIR /app
@@ -22,9 +29,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy dependency files and install Python dependencies (cached layer)
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
 
 # Create a non-root user for security
 RUN useradd -m -u 1000 coderunner \
