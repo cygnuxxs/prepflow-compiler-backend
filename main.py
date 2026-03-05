@@ -1,12 +1,14 @@
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from runner import CodeExecutor, ExecutionResult, ExecutionStage
 import logging
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any
 from contextlib import asynccontextmanager
+from functools import lru_cache
+import os
 
-origins = ['http://localhost:3000', 'https://prepflow.vercel.app']
+origins = os.environ.get('CORS_ORIGINS', 'http://localhost:3000,https://prepflow.vercel.app').split(',')
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -14,21 +16,21 @@ logger = logging.getLogger(__name__)
 
 
 class CodeExecutionRequest(BaseModel):
-    language: str
-    code: str
-    stdin: str = ""
+    language: str = Field(..., description="Programming language to execute")
+    code: str = Field(..., description="Source code to execute")
+    stdin: str = Field(default="", description="Standard input for the program")
 
 
 class ExecutionResponse(BaseModel):
-    success: bool
-    language: str
-    stage: str
-    output: str
-    error: str | None = None
-    compile_error: str | None = None
-    execution_time: float
-    return_code: int | None = None
-    memory_used_kb: int | None = None
+    success: bool = Field(..., description="Whether the execution was successful")
+    language: str = Field(..., description="Programming language used")
+    stage: str = Field(..., description="Execution stage (e.g., compilation, execution)")
+    output: str = Field(..., description="Standard output and standard error from the execution")
+    error: str | None = Field(default=None, description="General error message if any")
+    compile_error: str | None = Field(default=None, description="Compilation error message if applicable")
+    execution_time: float = Field(..., description="Time taken to execute the code in seconds")
+    return_code: int | None = Field(default=None, description="Exit code of the process")
+    memory_used_kb: int | None = Field(default=None, description="Memory used during execution in KB")
 
 
 @asynccontextmanager
@@ -56,6 +58,7 @@ app.add_middleware(
 )
 
 
+@lru_cache(maxsize=1)
 def get_executor() -> CodeExecutor:
     return CodeExecutor(
         timeout=3,
@@ -97,7 +100,7 @@ async def websocket_execute_code(websocket: WebSocket, executor: CodeExecutor = 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
     except Exception as e:
-        logger.error(f"WebSocket execution error: {str(e)}")
+        logger.error(f"WebSocket execution error: {str(e)}", exc_info=True)
         try:
             await websocket.send_text(f'Error: {str(e)}')
         except WebSocketDisconnect:
