@@ -34,6 +34,7 @@ class LanguageConfig:
     compile_cmd: Optional[List[str]] = None
     main_class: Optional[str] = None
     compiler_timeout: Optional[int] = None
+    run_timeout: Optional[int] = None
     memory_limit_kb: int = 128 * 1024
     requires_main_class: bool = False
 
@@ -91,10 +92,11 @@ class CodeExecutor:
         'java': LanguageConfig(
             extension='.java',
             compile_cmd=['javac', '{file}'],
-            run_cmd=['java', '-cp', '{dir}',
-                     '-Xmx{memory_limit}m', '{main_class}'],
+            run_cmd=['java', '-XX:TieredStopAtLevel=1', '-XX:+UseSerialGC',
+                     '-Xmx{memory_limit}m', '-cp', '{dir}', '{main_class}'],
             main_class='Main',
-            compiler_timeout=10,
+            compiler_timeout=20,
+            run_timeout=10,
             memory_limit_kb=192 * 1024,
             requires_main_class=True
         ),
@@ -648,6 +650,7 @@ class CodeExecutor:
 
                 # Prepare execution command
                 memory_limit_mb = self.memory_limit_kb // 1024
+                run_timeout = config.run_timeout or self.timeout
                 format_args = {
                     'file': str(source_file),
                     'exe': executable,
@@ -677,7 +680,7 @@ class CodeExecutor:
                     # Monitor execution
                     try:
                         stdout_data, _ = process.communicate(
-                            input=stdin_data, timeout=self.timeout)
+                            input=stdin_data, timeout=run_timeout)
                         return_code = process.returncode
                     except subprocess.TimeoutExpired:
                         # Kill process group to ensure cleanup
@@ -691,8 +694,8 @@ class CodeExecutor:
                             success=False,
                             language=language,
                             stage=ExecutionStage.EXECUTION.value,
-                            error=f"Execution timed out after {self.timeout} seconds",
-                            execution_time=self.timeout
+                            error=f"Execution timed out after {run_timeout} seconds",
+                            execution_time=run_timeout
                         )
 
                     exec_time = time.time() - start_time
